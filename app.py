@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request
 
-APP_VERSION = "1.0.0-crm-bridge"
+APP_VERSION = "1.0.1-crm-bridge-detailfix"
 SERVICE_NAME = "payeeproof-crm-bridge"
 DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof_crm_bridge.db")
 CRM_BRIDGE_SECRET = os.getenv("CRM_BRIDGE_SECRET", "")
@@ -125,6 +125,47 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "api_base": trim_text(links.get("api_base"), 300),
         },
     }
+
+
+def get_lead_by_key(conn: sqlite3.Connection, lead_key: str):
+    key = str(lead_key or "").strip()
+    if not key:
+        return None
+
+    row = conn.execute(
+        "SELECT * FROM crm_leads WHERE id = ?",
+        (key,),
+    ).fetchone()
+    if row:
+        return row
+
+    normalized = "".join(ch for ch in key if ch.isalnum() or ch in ("_", "-", ":"))
+    if normalized and normalized != key:
+        row = conn.execute(
+            "SELECT * FROM crm_leads WHERE id = ?",
+            (normalized,),
+        ).fetchone()
+        if row:
+            return row
+        key = normalized
+
+    row = conn.execute(
+        "SELECT * FROM crm_leads WHERE request_id = ?",
+        (key,),
+    ).fetchone()
+    if row:
+        return row
+
+    if key.startswith("lead_"):
+        suffix = key[5:]
+        if suffix:
+            row = conn.execute(
+                "SELECT * FROM crm_leads WHERE id LIKE ? ORDER BY created_at DESC LIMIT 1",
+                (f"lead_%{suffix}",),
+            ).fetchone()
+            if row:
+                return row
+    return None
 
 
 @app.get("/health")
@@ -251,10 +292,7 @@ def crm_lead_detail(lead_id: str):
         return auth_error
 
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM crm_leads WHERE id = ?",
-            (lead_id,),
-        ).fetchone()
+        row = get_lead_by_key(conn, lead_id)
     if not row:
         return jsonify({"ok": False, "error": "NOT_FOUND"}), 404
 
