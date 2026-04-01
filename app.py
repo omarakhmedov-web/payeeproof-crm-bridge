@@ -10,7 +10,7 @@ from typing import Any, Dict
 import requests
 from flask import Flask, jsonify, request
 
-APP_VERSION = "1.1.0-crm-bridge-sheets"
+APP_VERSION = "1.1.1-crm-bridge-payments"
 SERVICE_NAME = "payeeproof-crm-bridge"
 DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof_crm_bridge.db")
 CRM_BRIDGE_SECRET = os.getenv("CRM_BRIDGE_SECRET", "")
@@ -124,12 +124,102 @@ def trim_text(value: Any, max_len: int = 512) -> str:
     return text[:max_len]
 
 
+def pick_text(data: Dict[str, Any], *keys: str, max_len: int = 512) -> str:
+    for key in keys:
+        if key in data:
+            value = trim_text(data.get(key), max_len)
+            if value:
+                return value
+    return ""
+
+
+def summarize_payment_notes(payment: Dict[str, Any]) -> str:
+    parts = []
+    order_id = pick_text(payment, "order_id")
+    provider_invoice_id = pick_text(payment, "provider_invoice_id", "invoice_id")
+    payment_status = pick_text(payment, "payment_status")
+    product_title = pick_text(payment, "product_title", "title")
+    product_sku = pick_text(payment, "product_sku", "sku")
+    amount_usd = pick_text(payment, "amount_usd", "amount")
+
+    if order_id:
+        parts.append(f"order_id={order_id}")
+    if provider_invoice_id:
+        parts.append(f"provider_invoice_id={provider_invoice_id}")
+    if payment_status:
+        parts.append(f"payment_status={payment_status}")
+    if product_title:
+        parts.append(f"product={product_title}")
+    if product_sku:
+        parts.append(f"sku={product_sku}")
+    if amount_usd:
+        parts.append(f"amount_usd={amount_usd}")
+    return trim_text(" | ".join(parts), MAX_NOTES_LEN)
+
+
 def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    req = payload.get("request") or {}
-    meta = payload.get("meta") or {}
-    links = payload.get("links") or {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+    req = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
+
+    if not req and not payment:
+        payment_hint_keys = {
+            "order_id",
+            "provider_invoice_id",
+            "invoice_id",
+            "payment_status",
+            "customer_email",
+            "amount_usd",
+            "sku",
+            "product_title",
+        }
+        if payment_hint_keys.intersection(set(payload.keys())):
+            payment = payload
+        else:
+            req = payload
+
+    if payment:
+        order_id = pick_text(payment, "order_id", "request_id", max_len=120)
+        customer_email = pick_text(payment, "customer_email", "email", max_len=320)
+        notes = pick_text(payment, "notes", max_len=MAX_NOTES_LEN) or summarize_payment_notes(payment)
+        normalized_payment = {
+            "order_id": order_id,
+            "provider_invoice_id": pick_text(payment, "provider_invoice_id", "invoice_id", max_len=120),
+            "payment_status": pick_text(payment, "payment_status", max_len=80),
+            "product_title": pick_text(payment, "product_title", "title", max_len=200),
+            "product_sku": pick_text(payment, "product_sku", "sku", max_len=120),
+            "amount_usd": pick_text(payment, "amount_usd", "amount", max_len=80),
+            "customer_email": customer_email,
+        }
+        return {
+            "entity_type": "payment",
+            "event": trim_text(payload.get("event") or "payment_confirmed", 100),
+            "product": trim_text(payload.get("product") or normalized_payment["product_sku"] or "payeeproof", 100),
+            "request": {
+                "request_id": order_id,
+                "submitted_at": pick_text(payment, "paid_at", "confirmed_at", "submitted_at", max_len=100),
+                "name": pick_text(payment, "customer_name", "name", max_len=200),
+                "company": pick_text(payment, "company", max_len=200),
+                "email": customer_email,
+                "volume": pick_text(payment, "volume", max_len=200) or "paid_order",
+                "notes": notes,
+            },
+            "payment": normalized_payment,
+            "meta": {
+                "origin": trim_text(meta.get("origin"), 300),
+                "source_ip": trim_text(meta.get("source_ip"), 100),
+                "user_agent": trim_text(meta.get("user_agent"), 500),
+            },
+            "links": {
+                "site": trim_text(links.get("site") or SITE_URL, 300),
+                "api_base": trim_text(links.get("api_base"), 300),
+            },
+        }
+
     notes = trim_text(req.get("notes"), MAX_NOTES_LEN)
     return {
+        "entity_type": "request",
         "event": trim_text(payload.get("event") or "pilot_request_created", 100),
         "product": trim_text(payload.get("product") or "payeeproof", 100),
         "request": {
@@ -141,6 +231,7 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "volume": trim_text(req.get("volume"), 200),
             "notes": notes,
         },
+        "payment": {},
         "meta": {
             "origin": trim_text(meta.get("origin"), 300),
             "source_ip": trim_text(meta.get("source_ip"), 100),
@@ -189,27 +280,41 @@ def build_sheets_payload(lead_id: str, normalized: Dict[str, Any], created_at: s
     req = normalized.get("request") or {}
     meta = normalized.get("meta") or {}
     links = normalized.get("links") or {}
+    payment = normalized.get("payment") or {}
+    lead = {
+        "lead_id": lead_id,
+        "request_id": req.get("request_id") or "",
+        "created_at": created_at,
+        "submitted_at": req.get("submitted_at") or created_at,
+        "name": req.get("name") or "",
+        "company": req.get("company") or "",
+        "email": req.get("email") or "",
+        "volume": req.get("volume") or "",
+        "notes": req.get("notes") or "",
+        "origin": meta.get("origin") or "",
+        "source_ip": meta.get("source_ip") or "",
+        "user_agent": meta.get("user_agent") or "",
+        "site": links.get("site") or SITE_URL,
+        "api_base": links.get("api_base") or "",
+        "lead_url": f"{SITE_URL.rstrip('/')}/pilot-flow.html" if SITE_URL else "",
+    }
+    if payment:
+        lead.update(
+            {
+                "entity_type": normalized.get("entity_type") or "payment",
+                "order_id": payment.get("order_id") or req.get("request_id") or "",
+                "provider_invoice_id": payment.get("provider_invoice_id") or "",
+                "payment_status": payment.get("payment_status") or "",
+                "product_title": payment.get("product_title") or "",
+                "product_sku": payment.get("product_sku") or normalized.get("product") or "",
+                "amount_usd": payment.get("amount_usd") or "",
+            }
+        )
     return {
         "shared_secret": SHEETS_INTAKE_SECRET,
         "event": normalized.get("event") or "pilot_request_created",
         "product": SHEETS_INTAKE_PRODUCT,
-        "lead": {
-            "lead_id": lead_id,
-            "request_id": req.get("request_id") or "",
-            "created_at": created_at,
-            "submitted_at": req.get("submitted_at") or created_at,
-            "name": req.get("name") or "",
-            "company": req.get("company") or "",
-            "email": req.get("email") or "",
-            "volume": req.get("volume") or "",
-            "notes": req.get("notes") or "",
-            "origin": meta.get("origin") or "",
-            "source_ip": meta.get("source_ip") or "",
-            "user_agent": meta.get("user_agent") or "",
-            "site": links.get("site") or SITE_URL,
-            "api_base": links.get("api_base") or "",
-            "lead_url": f"{SITE_URL.rstrip('/')}/pilot-flow.html" if SITE_URL else "",
-        },
+        "lead": lead,
     }
 
 
